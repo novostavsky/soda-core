@@ -11,24 +11,32 @@ from soda_bigquery.common.data_sources.bigquery_data_source_connection import Bi
 from soda_core.common.data_source_connection import DataSourceConnection
 from soda_core.common.data_source_impl import DataSourceImpl
 from soda_core.common.logging_constants import soda_logger
-from soda_core.common.metadata_types import DataSourceNamespace, SodaDataTypeName
+from soda_core.common.metadata_types import ColumnMetadata, DataSourceNamespace, SodaDataTypeName
 from soda_core.common.sql_ast import (
     ADD_INTERVAL,
+    AND,
     COLUMN,
     CONCAT_WS,
     COUNT,
     CREATE_TABLE,
     CREATE_TABLE_IF_NOT_EXISTS,
     DISTINCT,
+    EQ,
+    FROM,
+    LIKE,
+    LIMIT,
     LITERAL,
+    ORDER_BY_DESC,
     PERCENTILE_WITHIN_GROUP,
     RANDOM,
+    SELECT,
     STRING_HASH,
     TIME_DELTA,
     TUPLE,
     UNION,
     UNION_ALL,
     VALUES,
+    WHERE,
     WITH,
 )
 from soda_core.common.sql_dialect import SqlDialect
@@ -182,6 +190,25 @@ class BigQueryDataSourceImpl(DataSourceImpl, model_class=BigQueryDataSourceModel
     def _build_columns_metadata_namespace(self, prefixes: list[str]) -> DataSourceNamespace:
         return BigQueryDataSourceNamespace(project_id=prefixes[0], dataset=prefixes[1])
 
+    def get_columns_metadata(self, dataset_prefixes: list[str], dataset_name: str) -> list[ColumnMetadata]:
+        # INFORMATION_SCHEMA has no row for a wildcard table, so its columns are those of the
+        # table BigQuery itself takes the wildcard schema from: the newest matching table.
+        if self.sql_dialect.is_wildcard_table_name(dataset_name):
+            newest_matching_table_name: Optional[str] = self._get_newest_wildcard_match(dataset_prefixes, dataset_name)
+            if newest_matching_table_name is None:
+                logger.debug(f"No BigQuery table matches wildcard table '{dataset_name}'")
+                return []
+            dataset_name = newest_matching_table_name
+        return super().get_columns_metadata(dataset_prefixes=dataset_prefixes, dataset_name=dataset_name)
+
+    def _get_newest_wildcard_match(self, dataset_prefixes: list[str], wildcard_table_name: str) -> Optional[str]:
+        sql: str = self.sql_dialect.build_newest_wildcard_match_query_str(
+            table_namespace=self._build_columns_metadata_namespace(dataset_prefixes),
+            wildcard_table_name=wildcard_table_name,
+        )
+        query_result = self.execute_query(sql)
+        return query_result.rows[0][0] if query_result.rows else None
+
     def create_metadata_primary_keys_query(self) -> MetadataPrimaryKeysQuery:
         # BigQuery exposes primary keys through the dataset-qualified INFORMATION_SCHEMA constraint views.
         return BigQueryMetadataPrimaryKeysQuery(
@@ -295,6 +322,50 @@ class BigQuerySqlDialect(SqlDialect, sqlglot_dialect="bigquery"):
 
     def information_schema_namespace_elements(self, data_source_namespace: BigQueryDataSourceNamespace) -> list[str]:
         return [data_source_namespace.project_id, data_source_namespace.dataset, "INFORMATION_SCHEMA"]
+
+    def is_wildcard_table_name(self, table_name: Optional[str]) -> bool:
+        # BigQuery only allows the wildcard as the last character of a table name.
+        return isinstance(table_name, str) and table_name.endswith("*")
+
+    def qualify_dataset_name(self, dataset_prefix: list[str], dataset_name: str) -> str:
+        if self.is_wildcard_table_name(dataset_name):
+            return self._quote_wildcard_table_path(dataset_prefix, dataset_name)
+        return super().qualify_dataset_name(dataset_prefix=dataset_prefix, dataset_name=dataset_name)
+
+    def _build_qualified_quoted_dataset_name(self, dataset_name: str, dataset_prefix: Optional[list[str]]) -> str:
+        if self.is_wildcard_table_name(dataset_name):
+            return self._quote_wildcard_table_path(dataset_prefix, dataset_name)
+        return super()._build_qualified_quoted_dataset_name(dataset_name=dataset_name, dataset_prefix=dataset_prefix)
+
+    def _quote_wildcard_table_path(self, dataset_prefix: Optional[list[str]], dataset_name: str) -> str:
+        # The documented wildcard form puts the whole path inside a single pair of backticks:
+        # `project.dataset.events_*` (https://cloud.google.com/bigquery/docs/querying-wildcard-tables).
+        path_parts: list[str] = [part for part in (dataset_prefix or []) if part] + [dataset_name]
+        return self.quote_default(".".join(path_parts))
+
+    def build_newest_wildcard_match_query_str(
+        self, table_namespace: BigQueryDataSourceNamespace, wildcard_table_name: str
+    ) -> str:
+        """Name of the newest base table matching a wildcard table: the table BigQuery takes the wildcard schema from."""
+        table_name_prefix: str = wildcard_table_name[:-1]
+        # `_` and `%` are LIKE wildcards and common in sharded table names (events_20240101).
+        like_escaped_prefix: str = table_name_prefix.replace("\\", "\\\\").replace("_", "\\_").replace("%", "\\%")
+        return self.build_select_sql(
+            [
+                SELECT([self.column_table_name()]),
+                FROM(self.table_tables()).IN(self.information_schema_namespace_elements(table_namespace)),
+                WHERE(
+                    AND(
+                        [
+                            EQ(self.column_table_type(), LITERAL("BASE TABLE")),
+                            LIKE(self.column_table_name(), LITERAL(f"{like_escaped_prefix}%")),
+                        ]
+                    )
+                ),
+                ORDER_BY_DESC(self.default_casify("creation_time")),
+                LIMIT(1),
+            ]
+        )
 
     def create_schema_if_not_exists_sql(self, prefixes: list[str], add_semicolon: Optional[bool] = None) -> str:
         # BigQuery datasets are project-scoped, so qualify the dataset with the project
