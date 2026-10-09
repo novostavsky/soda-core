@@ -26,6 +26,25 @@ shard_b_specification = (
 )
 
 
+# A separate wildcard family, SODATEST_wildcard_schema_*, so the extra column of the newest
+# table does not leak into the shard tests above.
+older_schema_specification = (
+    TestTableSpecification.builder()
+    .table_purpose("wildcard_schema_older")
+    .column_varchar("id")
+    .rows(rows=[("1",)])
+    .build()
+)
+
+newest_schema_specification = (
+    TestTableSpecification.builder()
+    .table_purpose("wildcard_schema_newest")
+    .column_varchar("id")
+    .column_integer("extra")
+    .rows(rows=[("2", 20)])
+    .build()
+)
+
 pytestmark = pytest.mark.skipif(test_datasource != "bigquery", reason="BigQuery-specific: wildcard tables")
 
 
@@ -76,5 +95,30 @@ def test_wildcard_table_filters_on_table_suffix(data_source_test_helper: DataSou
               - row_count:
                   threshold:
                     must_be: 2
+        """,
+    )
+
+
+def test_wildcard_schema_comes_from_newest_matching_table(data_source_test_helper: DataSourceTestHelper):
+    data_source_test_helper.ensure_test_table(older_schema_specification)
+    # Recreated every run: test tables are otherwise reused, so creation order would not be guaranteed.
+    data_source_test_helper.ensure_test_table(newest_schema_specification, force_recreate=True)
+    wildcard_dqn: str = "/".join(
+        [data_source_test_helper.data_source_impl.name]
+        + data_source_test_helper.dataset_prefix
+        + ["SODATEST_wildcard_schema_*"]
+    )
+
+    # `extra` only exists in the newest table, so the schema check passes only when the
+    # wildcard schema is read from it rather than from the older table.
+    data_source_test_helper.assert_contract_pass(
+        test_table=None,
+        contract_yaml_str=f"""
+            dataset: {wildcard_dqn}
+            columns:
+              - name: id
+              - name: extra
+            checks:
+              - schema:
         """,
     )

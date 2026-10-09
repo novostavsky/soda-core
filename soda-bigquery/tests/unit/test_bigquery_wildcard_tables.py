@@ -45,7 +45,10 @@ def test_newest_wildcard_match_query_escapes_like_wildcards_in_prefix():
         wildcard_table_name="events_*",
     )
     assert "FROM `my-proj`.`analytics`.`INFORMATION_SCHEMA`.`TABLES`" in sql
-    assert "`TABLE_TYPE` = '''BASE TABLE'''" in sql
+    # Views are excluded; clones and snapshots stay eligible as the newest matching table.
+    assert "`TABLE_TYPE` != '''VIEW'''" in sql
+    assert "`TABLE_TYPE` != '''MATERIALIZED VIEW'''" in sql
+    assert "BASE TABLE" not in sql
     # The literal decodes to events\_% : `_` matches literally, `%` takes the place of `*`.
     assert "`TABLE_NAME` like '''events\\\\_%'''" in sql
     assert "ORDER BY `CREATION_TIME` DESC" in sql

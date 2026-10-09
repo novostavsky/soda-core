@@ -21,11 +21,11 @@ from soda_core.common.sql_ast import (
     CREATE_TABLE,
     CREATE_TABLE_IF_NOT_EXISTS,
     DISTINCT,
-    EQ,
     FROM,
     LIKE,
     LIMIT,
     LITERAL,
+    NEQ,
     ORDER_BY_DESC,
     PERCENTILE_WITHIN_GROUP,
     RANDOM,
@@ -328,6 +328,8 @@ class BigQuerySqlDialect(SqlDialect, sqlglot_dialect="bigquery"):
         return isinstance(table_name, str) and table_name.endswith("*")
 
     def qualify_dataset_name(self, dataset_prefix: list[str], dataset_name: str) -> str:
+        # No query in this repo is built from this name (queries go through FROM), but it is exposed
+        # as CheckCollectionImpl.sql_qualified_dataset_name, so it must name the same table FROM does.
         if self.is_wildcard_table_name(dataset_name):
             return self._quote_wildcard_table_path(dataset_prefix, dataset_name)
         return super().qualify_dataset_name(dataset_prefix=dataset_prefix, dataset_name=dataset_name)
@@ -346,7 +348,7 @@ class BigQuerySqlDialect(SqlDialect, sqlglot_dialect="bigquery"):
     def build_newest_wildcard_match_query_str(
         self, table_namespace: BigQueryDataSourceNamespace, wildcard_table_name: str
     ) -> str:
-        """Name of the newest base table matching a wildcard table: the table BigQuery takes the wildcard schema from."""
+        """Name of the newest table matching a wildcard table: the table BigQuery takes the wildcard schema from."""
         table_name_prefix: str = wildcard_table_name[:-1]
         # `_` and `%` are LIKE wildcards and common in sharded table names (events_20240101).
         like_escaped_prefix: str = table_name_prefix.replace("\\", "\\\\").replace("_", "\\_").replace("%", "\\%")
@@ -357,7 +359,12 @@ class BigQuerySqlDialect(SqlDialect, sqlglot_dialect="bigquery"):
                 WHERE(
                     AND(
                         [
-                            EQ(self.column_table_type(), LITERAL("BASE TABLE")),
+                            # Views are excluded rather than base tables included: a clone or snapshot
+                            # matching the wildcard still counts as BigQuery's newest table.
+                            *[
+                                NEQ(self.column_table_type(), LITERAL(view_type))
+                                for view_type in ("VIEW", "MATERIALIZED VIEW")
+                            ],
                             LIKE(self.column_table_name(), LITERAL(f"{like_escaped_prefix}%")),
                         ]
                     )
